@@ -400,11 +400,11 @@ async function executeGameReviewTask(task, client, fetchSnapshotFn, account) {
   return { ok: false, message: `游戏评价发帖失败: ${resp.msg || resp.status}` };
 }
 
+// [custom-20261015] 停用限时任务(task_id=33)，仅保留每日任务（签到+3个分享）
 const TASK_HANDLERS = {
   "1": executeSharePost,
   "19": executeShareGameDetail,
   "31": executeShareGameComment,
-  "33": executeTimeLimitTask,
   "24": executeGameReviewTask,
 };
 
