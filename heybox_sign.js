@@ -2,6 +2,11 @@
 小黑盒 - 每日任务
 账号环境变量:
   heybox_ck=pkey=xxx;x_xhh_tokenid=xxx;imei=xxx;device_info=xxx;os_version=16;dw=411;channel=heybox_xiaomi;
+
+注意：本复刻只保留 4 个基础每日任务（签到 + 分享帖子 1 + 分享游戏详情 19 + 分享游戏评论 31）。
+会创建内容的任务已整体移除：限时发帖(33)、游戏评价(24)。
+这两个任务的实现是「发帖 → 等 3 秒 → 删帖」，平台风控可识别为第三方客户端刷量，
+实测会触发账号限制（无法评论、购买、抽奖等），故不再提供。
 */
 const { $, tools } = require("./src/core");
 const {
@@ -13,12 +18,6 @@ const {
   OK_STATE,
   PATH_DATA_REPORT,
   sendShareEvents,
-  DEFAULT_POST_TITLE,
-  DEFAULT_POST_CONTENT,
-  DEFAULT_REVIEW_CONTENT,
-  postTopic,
-  postGameReview,
-  deletePost,
 } = require("./src/heybox");
 
 exports.name = "小黑盒.每日任务";
@@ -39,6 +38,8 @@ const POST_SHARE_VIEW_MILLISECONDS = 5000;
 const SHARE_TASK_SETTLE_MS = 2200;
 const TASK_LIST_ERROR_CODE = "HEYBOX_TASK_LIST_INVALID";
 const DAILY_SHARE_TASK_IDS = Object.freeze(["1", "19", "31"]);
+// 已移除的任务：33 限时发帖、24 游戏评价。它们会发帖后删帖，是账号被风控的主要来源。
+const DISABLED_TASK_IDS = new Set(["24", "33"]);
 
 const FEEDS_QUERY_BASE = Object.freeze({
   pull: "1",
@@ -119,39 +120,6 @@ function validateTaskListPayload(payload) {
     }
   }
   return snapshot;
-}
-
-function parseMaxjia(protocol) {
-  const text = tools.toText(protocol);
-  if (!text.startsWith("heybox://")) return null;
-  try {
-    const parsed = JSON.parse(decodeURIComponent(text.slice("heybox://".length)));
-    return isObject(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-async function runWithPostCleanup(client, linkId, operation) {
-  let operationError;
-  try {
-    return await operation();
-  } catch (error) {
-    operationError = error;
-    throw error;
-  } finally {
-    try {
-      const response = await deletePost(client, linkId);
-      if (!isOkPayload(response)) {
-        throw new Error(responseFailure(`删除帖子失败 link_id=${linkId}: ${response?.msg || response?.status || "无错误说明"}`, response));
-      }
-      tools.log(`帖子已删除 link_id=${linkId}`);
-    } catch (error) {
-      const message = error.message;
-      if (operationError) operationError.message += `；清理失败: ${message}`;
-      else throw new Error(`清理失败: ${message}`);
-    }
-  }
 }
 
 function extractTaskList(payload) {
@@ -265,6 +233,16 @@ function isDailyTask(task) {
   return isSignTask(task) || task.reportTaskType === "daily";
 }
 
+function isDisabledTask(task) {
+  return DISABLED_TASK_IDS.has(task.taskId);
+}
+
+// 只有签到、3 个分享和已注册的处理器才会被执行；33/24 即使下发也不会进入执行流程
+function isExecutableTask(task) {
+  if (isDisabledTask(task)) return false;
+  return isDailyTask(task) || Boolean(TASK_HANDLERS[task.taskId]);
+}
+
 async function settleShareTask(task, fetchSnapshotFn, detail) {
   await tools.sleep(SHARE_TASK_SETTLE_MS);
   const snapshot = await fetchSnapshotFn();
@@ -356,67 +334,18 @@ async function executeShareGameComment(task, client, fetchSnapshotFn) {
   return settleShareTask(task, fetchSnapshotFn, `appid=${game.appid}`);
 }
 
-async function executeTimeLimitTask(task, client, fetchSnapshotFn) {
-  const parsed = parseMaxjia(task.maxjia);
-  const topicId = tools.toText(parsed?.params?.topic_id);
-  if (!/^\d+$/.test(topicId)) {
-    return { ok: false, unsupported: true, message: `${task.title} 缺少 topic_id` };
-  }
-
-  const resp = await postTopic(client, topicId, DEFAULT_POST_TITLE, DEFAULT_POST_CONTENT);
-
-  if (resp?.status === OK_STATE && resp.result && resp.result.link_id) {
-    const linkId = resp.result.link_id;
-    tools.log(`发帖成功: link_id=${linkId}`);
-    return runWithPostCleanup(client, linkId, async () => {
-      await tools.sleep(3000);
-      return settleShareTask(task, fetchSnapshotFn, `link_id=${linkId}`);
-    });
-  }
-
-  return { ok: false, message: responseFailure(`发帖失败: ${resp?.msg || resp?.status || "响应无状态"}`, resp) };
-}
-
-async function executeGameReviewTask(task, client, fetchSnapshotFn, account) {
-  const parsed = parseMaxjia(task.maxjia);
-  const appId = tools.toText(parsed?.app_id);
-
-  if (!/^\d+$/.test(appId)) {
-    return { ok: false, unsupported: true, message: `${task.title} 缺少 app_id` };
-  }
-
-  const resp = await postGameReview(client, appId, 5, DEFAULT_REVIEW_CONTENT);
-
-  if (resp?.status === OK_STATE && resp.result?.link_id) {
-    const linkId = resp.result.link_id;
-    tools.log(`游戏评价发帖成功: link_id=${linkId}`);
-    return runWithPostCleanup(client, linkId, async () => {
-      let snapshot;
-      for (let i = 0; i < 7; i++) {
-        await tools.sleep(2000);
-        snapshot = await fetchSnapshotFn();
-        const after = findTaskByKey(snapshot, taskKey(task));
-        if (after && after.state === FINISH_STATE) {
-          return { ok: true, message: `${task.title} 完成`, snapshot };
-        }
-      }
-      return { ok: false, message: responseFailure(`游戏评价发帖成功(link_id=${linkId})但任务未完成`, snapshot?.payload) };
-    });
-  }
-
-  return { ok: false, message: responseFailure(`游戏评价发帖失败: ${resp?.msg || resp?.status || "响应无状态"}`, resp) };
-}
-
-// [custom-20261015] 停用限时任务(task_id=33)，仅保留每日任务（签到+3个分享）
+// [custom] 仅保留 4 个基础每日任务：签到 + 分享帖子(1) + 分享游戏详情(19) + 分享游戏评论(31)
+// 限时发帖(33) 与 游戏评价(24) 的实现已整体删除，不再有任何发帖/删帖调用
 const TASK_HANDLERS = {
   "1": executeSharePost,
   "19": executeShareGameDetail,
   "31": executeShareGameComment,
-  "24": executeGameReviewTask,
 };
 
 async function executeTask(task, client, fetchSnapshotFn, account) {
-  // 支持所有已实现的任务类型（不限于 isDailyTask）
+  if (isDisabledTask(task)) {
+    return { ok: false, unsupported: true, disabled: true, message: `task_id=${task.taskId} 已在本复刻中删除，不会发布任何内容` };
+  }
   const handler = isSignTask(task) ? (t, c) => executeSign(c) : TASK_HANDLERS[task.taskId];
   if (!handler) return { ok: false, unsupported: true, message: `未支持任务 task_id=${task.taskId}` };
   try {
@@ -442,17 +371,15 @@ async function runAccount(account, runtime) {
   account.log("开始每日任务");
   const client = new HeyboxAppClient(account, { runtime });
   let snapshot = await fetchSnapshot(client);
-  const expectedTaskKeys = snapshot.tasks.filter((task) => isDailyTask(task) || TASK_HANDLERS[task.taskId]).map(taskKey);
+  const expectedTaskKeys = snapshot.tasks.filter(isExecutableTask).map(taskKey);
   const fetchCurrentSnapshot = () => fetchSnapshot(client, expectedTaskKeys);
   account.log(`账号=${snapshot.nickname || account.heyboxId} 黑盒ID=${account.heyboxId} IMEI=${account.imei}`);
 
   const unsupported = new Set();
   const done = new Set();
   const failed = new Set();
-  // 支持所有已实现的任务类型（每日任务 + time_limit 任务）
-  const allTasks = snapshot.tasks.filter(
-    (task) => isDailyTask(task) || TASK_HANDLERS[task.taskId],
-  );
+  // 仅执行签到、3 个分享；33/24 已在 isExecutableTask 中被过滤掉
+  const allTasks = snapshot.tasks.filter(isExecutableTask);
   for (const task of allTasks) {
     if (task.state === FINISH_STATE) {
       done.add(taskKey(task));
@@ -490,7 +417,7 @@ async function runAccount(account, runtime) {
   snapshot = await fetchCurrentSnapshot();
   account.log(`当前总H币: ${snapshot.coin || "未知"}`);
   if (unsupported.size) account.log(`未支持任务: ${Array.from(unsupported).join(" | ")}`);
-  const finalTasks = snapshot.tasks.filter((task) => isDailyTask(task) || TASK_HANDLERS[task.taskId]);
+  const finalTasks = snapshot.tasks.filter(isExecutableTask);
   done.clear();
   for (const task of finalTasks) {
     if (task.state === FINISH_STATE && !failed.has(taskKey(task))) done.add(taskKey(task));
